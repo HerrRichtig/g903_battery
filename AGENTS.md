@@ -2,8 +2,8 @@
 
 ## Project Structure & Module Organization
 
-- `G903控制面板.pyw` is the user-facing Windows GUI launcher; `g903_battery.py`
-  is the command-line battery reader.
+- `控制面板_瑞士国际主义.pyw` and `控制面板_卡带未来主义.pyw` are the Windows
+  GUI launchers; `g903_battery.py` is the command-line battery reader.
 - `g903_app/` contains the GUI, HID++ control logic, shared theme, and wave bar.
 - `tools/probe_features.py` is a read-only HID++ feature probe. Keep diagnostics
   separate from settings writes.
