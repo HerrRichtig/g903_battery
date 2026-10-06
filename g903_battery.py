@@ -6,131 +6,78 @@ G903 LIGHTSPEED 电量查询脚本 v8（排除充电读数 + 有线/无线自适
   因此电量 % 只能按锂电放电曲线估算。
 
 v8 改动（相对 v7）：
-- 趋势结论仅统计"未充电"的静置读数，排除充电/通道切换抬高的电��，
+- 趋势结论仅统计"未充电"的静置读数，排除充电/通道切换抬高的电压，
   使结论更准确反映真实耗电。
 - 保留 v7 的有线/无线自适应 + 静默 CSV 记录。
 """
 
 import csv
-import io
 import os
 import sys
 import time
 from datetime import datetime
 
-import hid
+from g903_app import g903_control as ctl
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-elif hasattr(sys.stdout, "buffer"):
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
-
-VID = 0x046D
-PID_PRIORITY = {0xC086: 0, 0xC539: 1}
-
-REPORT_ID_LONG = 0x11
-DEVICE_IDX = 0x01
-FEATURE_ROOT = 0x0000
-FEATURE_BATTERY_VOLTAGE = 0x1001
-SW_ID = 0x0A
-
-REPORT_LEN = 20
-FRAME_ERROR = 0x8F
 
 HISTORY_CSV = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                           "g903_battery_history.csv")
+                           "data", "g903_battery_history.csv")
 SAMPLES = 3
 MIN_REAL_DELTA = 15
 
+# 标准单节锂电放电曲线（与 Solaar estimate_battery_level_percentage /
+# OpenLogi voltage_battery_percentage 完全一致，严格单调 13 点）。
 DISCHARGE_CURVE = [
-    (4200, 100), (4100, 94), (4000, 88), (3950, 82), (3900, 76),
-    (3850, 68), (3800, 60), (3770, 52), (3750, 47), (3720, 42),
-    (3690, 36), (3660, 30), (3600, 22), (3500, 12), (3400, 5),
-    (3300, 0),
+    (4186, 100), (4067, 90), (3989, 80), (3922, 70), (3859, 60),
+    (3811, 50), (3778, 40), (3751, 30), (3717, 20), (3671, 10),
+    (3646, 5), (3579, 2), (3500, 0),
 ]
 
+# 电池状态常量（来自 HID++ 0x1001 Battery Voltage 的 status 字节）。
+BATTERY_DISCHARGING = "discharging"   # 放电 / 不充电（电平被动使用）
+BATTERY_CHARGING = "charging"         # 正常充电
+BATTERY_CHARGING_FAST = "charging_fast"  # 快充
+BATTERY_CHARGING_SLOW = "charging_slow"  # 慢充（涓流）
+BATTERY_FULL = "full"                 # 充满
+BATTERY_NOT_CHARGING = "not_charging" # 插电但未在充电（如已充满/温度保护）
+BATTERY_FAULT = "fault"               # 充电故障
 
-def find_hidpp_long_paths():
-    candidates = []
-    for info in hid.enumerate(VID):
-        if info.get("usage_page") == 0xFF00 and info.get("usage") == 0x0002:
-            pid = info.get("product_id")
-            priority = PID_PRIORITY.get(pid, 2)
-            candidates.append((priority, info["path"], pid))
-    candidates.sort(key=lambda x: x[0])
-    return [(path, pid) for _, path, pid in candidates]
-
-
-def probe_feature(path, feature_id):
-    dev = None
-    try:
-        dev = hid.device()
-        dev.open_path(path)
-
-        def send_and_wait(report, timeout_ms=800):
-            dev.write(report)
-            resp = dev.read(REPORT_LEN, timeout_ms=timeout_ms)
-            if resp and len(resp) >= 1 and resp[0] == REPORT_ID_LONG and resp[1] == report[1]:
-                return resp
-            return None
-
-        fid_hi = (feature_id >> 8) & 0xFF
-        fid_lo = feature_id & 0xFF
-        resp = send_and_wait(build_request(DEVICE_IDX, 0x00, 0x00, [fid_hi, fid_lo, 0x00]))
-        return bool(resp and len(resp) > 4 and resp[4] != 0)
-    except Exception:
-        return False
-    finally:
-        if dev is not None:
-            try:
-                dev.close()
-            except Exception:
-                pass
+# 状态 → 中文标签（GUI/CLI 展示用）。
+BATTERY_STATUS_LABEL = {
+    BATTERY_DISCHARGING: "放电（未充电）",
+    BATTERY_CHARGING: "充电中",
+    BATTERY_CHARGING_FAST: "快充中",
+    BATTERY_CHARGING_SLOW: "慢充中",
+    BATTERY_FULL: "已充满",
+    BATTERY_NOT_CHARGING: "插电未充电",
+    BATTERY_FAULT: "充电故障",
+}
 
 
-def find_active_hidpp_path():
-    for path, pid in find_hidpp_long_paths():
-        if probe_feature(path, FEATURE_BATTERY_VOLTAGE):
-            return path, pid
-    return None, None
+def decode_battery_status(status_byte):
+    """按 HID++ 0x1001 status 字节解析充电状态（与 OpenLogi VoltageChargingStatus::from_flags 完全一致）。
 
-
-def build_request(device_idx, feature_idx, function_id, params):
-    if len(params) > 16:
-        raise ValueError(f"params 长度超过 16 字节: {len(params)}")
-    func_sw = ((function_id & 0x0F) << 4) | (SW_ID & 0x0F)
-    payload = list(params) + [0x00] * (16 - len(params))
-    return [REPORT_ID_LONG, device_idx, feature_idx, func_sw] + payload
-
-
-def send_and_wait(dev, report, timeout_ms=800):
-    dev.write(report)
-    resp = dev.read(REPORT_LEN, timeout_ms=timeout_ms)
-    if resp and len(resp) >= 1 and resp[0] == REPORT_ID_LONG and resp[1] == report[1]:
-        return resp
-    return None
-
-
-def check_error(resp):
-    if len(resp) > 2 and resp[2] == FRAME_ERROR:
-        err_code = resp[5] if len(resp) > 5 else resp[-1]
-        raise RuntimeError(f"设备返回错误，错误码 0x{err_code:02x}")
-
-
-def get_feature_index(dev, feature_id):
-    fid_hi = (feature_id >> 8) & 0xFF
-    fid_lo = feature_id & 0xFF
-    report = build_request(DEVICE_IDX, 0x00, 0x00, [fid_hi, fid_lo, 0x00])
-    resp = send_and_wait(dev, report)
-    if not resp:
-        raise RuntimeError(f"查询 feature 0x{feature_id:04x} 无响应")
-    check_error(resp)
-    if len(resp) <= 4:
-        raise RuntimeError(f"查询 feature 0x{feature_id:04x} 响应过短")
-    feature_idx = resp[4]
-    if feature_idx == 0:
-        raise RuntimeError(f"设备不支持 feature 0x{feature_id:04x}")
-    return feature_idx
+    位定义：
+      bit7          0 = 正在放电，1 = 已接外部电源
+      bit1..0       0b01 或 0b11 = 已充满；0b10 = 未在充电（故障）；0b00 = 充电中
+      bit3          1 = 快速充电
+      bit4          1 = 慢速充电
+    """
+    if not (status_byte & 0x80):
+        return BATTERY_DISCHARGING
+    low2 = status_byte & 0x03
+    if low2 == 0b01 or low2 == 0b11:
+        return BATTERY_FULL
+    if low2 == 0b10:
+        return BATTERY_NOT_CHARGING  # 外部供电但未充电（故障/保护）
+    # low2 == 0b00：充电中，看速度位。
+    if status_byte & (1 << 3):
+        return BATTERY_CHARGING_FAST
+    if status_byte & (1 << 4):
+        return BATTERY_CHARGING_SLOW
+    return BATTERY_CHARGING
 
 
 def parse_battery_response(resp):
@@ -138,16 +85,7 @@ def parse_battery_response(resp):
         raise RuntimeError("电量响应过短，无法解析电压与充电状态")
     voltage_mv = int.from_bytes(bytes(resp[4:6]), "big")
     status_byte = resp[6]
-    return voltage_mv, bool(status_byte & 0x80)
-
-
-def get_battery(dev, battery_feature_idx):
-    report = build_request(DEVICE_IDX, battery_feature_idx, 0x00, [0x00, 0x00, 0x00])
-    resp = send_and_wait(dev, report)
-    if not resp:
-        raise RuntimeError("查询电量无响应")
-    check_error(resp)
-    return resp
+    return voltage_mv, decode_battery_status(status_byte)
 
 
 def estimate_percent(voltage_mv):
@@ -159,30 +97,33 @@ def estimate_percent(voltage_mv):
         if v_lo <= voltage_mv <= v_hi:
             frac = (voltage_mv - v_hi) / (v_lo - v_hi)
             return round(p_hi + frac * (p_lo - p_hi))
-    return None
 
 
 def measure(dev, batt_idx, samples=SAMPLES):
     values = []
-    charging = False
+    status = BATTERY_DISCHARGING
     last_resp = None
     for _ in range(samples):
-        resp = get_battery(dev, batt_idx)
-        v, charging = parse_battery_response(resp)
+        resp = ctl.call(dev, batt_idx, 0x00, [0x00, 0x00, 0x00])
+        v, status = parse_battery_response(resp)
         values.append(v)
         last_resp = resp
     values.sort()
-    return values, values[samples // 2], charging, last_resp
+    return values, values[samples // 2], status, last_resp
 
 
-def append_history(v1, v2, v3, median, charging, percent):
+def append_history(v1, v2, v3, median, status, percent):
     new_file = not os.path.exists(HISTORY_CSV)
     with open(HISTORY_CSV, "a", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         if new_file:
-            w.writerow(["time", "v1", "v2", "v3", "voltage", "charging", "percent"])
-        w.writerow([time.strftime("%Y-%m-%d %H:%M:%S"),
-                    v1, v2, v3, median, int(charging), percent])
+            w.writerow(["time", "v1", "v2", "v3", "voltage", "status", "charging", "percent"])
+        charging = 1 if status != BATTERY_DISCHARGING else 0
+        row = [time.strftime("%Y-%m-%d %H:%M:%S"),
+               v1, v2, v3, median, status]
+        row.append(charging)
+        row.append("" if percent is None else percent)
+        w.writerow(row)
 
 
 def summarize_history():
@@ -227,40 +168,52 @@ def summarize_history():
     return f"结论：静置电压整体平稳（前后差 {abs(delta)} mV，噪声极差 {hi - lo} mV），暂未观察到明显耗电变化（静置 {n} 条 / 跨度 {span_h / 24:.1f} 天，已排除 {charging_excluded} 条充电读数）。"
 
 
-def main():
-    path, pid = find_active_hidpp_path()
-    if not path:
-        print("未找到��用的长报文 HID++ 接口")
-        sys.exit(1)
-
-    dev = None
+def read_once():
+    """读取一次电量，返回 (info, summary, error)。"""
+    dev, pid = ctl.open_device()
+    if dev is None:
+        return None, None, "未找到可用的长报文 HID++ 接口"
     try:
-        dev = hid.device()
-        dev.open_path(path)
         channel = "有线" if pid == 0xC086 else ("无线" if pid == 0xC539 else f"PID 0x{pid:04x}")
-
-        batt_idx = get_feature_index(dev, FEATURE_BATTERY_VOLTAGE)
-        values, median, charging, last_resp = measure(dev, batt_idx)
-        percent = estimate_percent(median)
-
-        print(f"接口通道: {channel} (PID 0x{pid:04x})")
-        print(f"原始响应字节: {[hex(b) for b in last_resp]}")
-        print(f"\n电压: {median} mV (本次 {SAMPLES} 次采样: {values})")
-        print(f"充电状态: {'充电中' if charging else '未充电'}")
-        print(f"估算电量: 约 {percent}%")
-
-        append_history(values[0], values[1], values[2], median, charging, percent)
-        summary = summarize_history()
-        if summary:
-            print(f"\n{summary}")
-
+        batt_idx = ctl.get_index(dev, ctl.FEATURE_BATTERY_VOLTAGE)
+        values, median, status, last_resp = measure(dev, batt_idx)
+        charging = status != BATTERY_DISCHARGING
+        ipct = estimate_percent(median) if status == BATTERY_DISCHARGING else None
+        append_history(values[0], values[1], values[2], median, status, ipct)
+        return {
+            "channel": channel, "pid": pid, "values": values,
+            "voltage": median, "charging": charging, "status": status,
+            "percent": ipct,
+            "raw": [hex(b) for b in last_resp],
+        }, summarize_history(), None
     except (RuntimeError, OSError, ValueError) as e:
-        print(f"出错: {e}")
+        return None, None, f"出错: {e}"
     except Exception as e:
-        print(f"未知错误: {e}")
+        return None, None, f"未知错误: {e}"
     finally:
         if dev is not None:
-            dev.close()
+            try:
+                dev.close()
+            except Exception:
+                pass
+
+
+def main():
+    info, summary, err = read_once()
+    if err:
+        print(err)
+        sys.exit(1)
+
+    print(f"接口通道: {info['channel']} (PID 0x{info['pid']:04x})")
+    print(f"原始响应字节: {info['raw']}")
+    print(f"\n电压: {info['voltage']} mV (本次 {SAMPLES} 次采样: {info['values']})")
+    print(f"充电状态: {BATTERY_STATUS_LABEL.get(info['status'], info['status'])}")
+    if info["percent"] is None:
+        print("估算电量: —（充电时电压不稳定，不估算百分比）")
+    else:
+        print(f"估算电量: 约 {info['percent']}%")
+    if summary:
+        print(f"\n{summary}")
 
 
 if __name__ == "__main__":
